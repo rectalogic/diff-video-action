@@ -1,0 +1,69 @@
+# Copyright (C) 2025 Andrew Wason
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: "Diff Video"
+description: "Compare videos to a reference set of videos and fail and generate visual diffs if different"
+inputs:
+  current-video-path:
+    description: "A path to the current videos to be compared to reference"
+    required: true
+    default: "output"
+  reference-video-glob:
+    description: "A path glob to the reference videos"
+    required: true
+    default: "fixtures/*.mp4"
+  diff-video-path:
+    description: "Path to store any difference videos in"
+    required: true
+    default: "diff-output"
+  video-threshold:
+    description: "Threshold for comparing video (100 is identical)"
+    default: "99.999"
+  audio-threshold:
+    description: "Threshold for comparing audio (0 is identical)"
+    default: "0"
+  ffmpeg-path:
+    description: "Path to installed ffmpeg to use"
+    default: "ffmpeg"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Diff videos
+      shell: bash
+      env:
+        CURRENT_VIDEO_PATH: ${{ inputs.current-video-path }}
+        REFERENCE_VIDEO_GLOB: ${{ inputs.reference-video-glob }}
+        DIFF_VIDEO_PATH: ${{ inputs.diff-video-path }}
+        VIDEO_THRESHOLD: ${{ inputs.video-threshold }}
+        AUDIO_THRESHOLD: ${{ inputs.audio-threshold }}
+        FFMPEG_PATH: ${{ inputs.ffmpeg-path }}
+      run: |
+        mkdir -p "${DIFF_VIDEO_PATH}"
+        FAIL=0
+        for reference_video in ${REFERENCE_VIDEO_GLOB}; do
+            video_name=$(basename "$reference_video")
+            current_video="${CURRENT_VIDEO_PATH}/${video_name}"
+
+            # If reference has audio, then compare it
+            if "${{ github.action_path }}/has-audio.sh" "$reference_video"; then
+                # Invert one audio and mix with the other. Result should be silence if identical.
+                # Delete all metadata with mean=0, anything remaining is a difference.
+                # Need duration=first on amix due to ffmpeg 6.1 bug (it leaves original audio in the mix otherwise)
+                AUDIO_OUTPUT=$( ${FFMPEG_PATH} -loglevel warning -hide_banner -vn -i "${current_video}" -vn -i "${reference_video}" -filter_complex "[1] aeval=-val(0)|-val(1) [invert]; [0][invert] amix=normalize=0:duration=first [out]; [out] aspectralstats=measure=mean:win_size=32,ametadata=delete:key=lavfi.aspectralstats.1.mean:value=${AUDIO_THRESHOLD}:function=equal,ametadata=delete:key=lavfi.aspectralstats.2.mean:value=${AUDIO_THRESHOLD}:function=equal,ametadata=print:file=-" -f null - | { grep mean || true; } ) || exit 1
+            else
+                AUDIO_OUTPUT=""
+            fi
+
+            # https://superuser.com/questions/1615310/how-to-use-ffmpeg-blend-difference-filter-mode-to-identify-frame-differences-bet
+            VIDEO_OUTPUT=$( ${FFMPEG_PATH} -loglevel warning -hide_banner -an -i "${current_video}" -an -i "${reference_video}" -filter_complex "blend=all_mode=difference,blackframe=amount=0:threshold=3,metadata=select:key=lavfi.blackframe.pblack:value=${VIDEO_THRESHOLD}:function=less,metadata=print:file=-" -an -f null - | { grep pblack || true; } ) || exit 1
+
+            if [[ -n "$AUDIO_OUTPUT" || -n "$VIDEO_OUTPUT" ]]; then
+                echo Fail $current_video
+                echo Audio output: $AUDIO_OUTPUT
+                echo Video output: $VIDEO_OUTPUT
+                FAIL=1
+                "${{ github.action_path }}/diff-video.sh" "${reference_video}" "${current_video}" "${DIFF_VIDEO_PATH}/${video_name}.diff.nut"
+            fi
+        done
+        exit $FAIL
